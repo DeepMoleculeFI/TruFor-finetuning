@@ -2,6 +2,7 @@
 """
 Combined Training and Evaluation Script for AI Manipulation Detection using TruFor
 Supports training on any dataset size and evaluates using Dice coefficient
+Using Dice Loss only instead of combined loss
 """
 
 import os
@@ -92,9 +93,44 @@ class AIManipDataset(torch.utils.data.Dataset):
         
         return img_tensor, mask_tensor
 
+def dice_loss(pred, target, smooth=1.0):
+    """
+    Calculate Dice loss directly without thresholding for backpropagation
+    
+    Args:
+        pred: Prediction tensor (B, H, W) or (H, W)
+        target: Target tensor (B, H, W) or (H, W)
+        smooth: Smoothing factor
+        
+    Returns:
+        Dice loss (float)
+    """
+    # Apply sigmoid if prediction is logits
+    if pred.max() > 1 or pred.min() < 0:
+        pred = torch.sigmoid(pred)
+    
+    # Convert target to float
+    target = target.float()
+    
+    # Flatten tensors
+    pred_flat = pred.view(-1)
+    target_flat = target.view(-1)
+    
+    # Calculate intersection and union
+    intersection = (pred_flat * target_flat).sum()
+    union = pred_flat.sum() + target_flat.sum()
+    
+    # Handle empty masks
+    if union == 0:
+        return 1.0 - torch.tensor(1.0, device=pred.device, requires_grad=True)
+    
+    # Calculate Dice coefficient and return loss
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return 1.0 - dice
+
 def dice_coefficient(pred, target, smooth=1.0, threshold=0.5):
     """
-    Calculate Dice coefficient
+    Calculate Dice coefficient for evaluation
     
     Args:
         pred: Prediction tensor (B, H, W) or (H, W)
@@ -105,55 +141,49 @@ def dice_coefficient(pred, target, smooth=1.0, threshold=0.5):
     Returns:
         Dice coefficient (float)
     """
-    if isinstance(pred, torch.Tensor):
-        # Apply sigmoid if prediction is logits
-        if pred.max() > 1 or pred.min() < 0:
-            pred = torch.sigmoid(pred)
-        
-        # Apply threshold
-        pred = (pred > threshold).float()
-        target = target.float()
-        
-        # Flatten tensors
-        pred_flat = pred.view(-1)
-        target_flat = target.view(-1)
-        
-        # Calculate intersection and union
-        intersection = (pred_flat * target_flat).sum()
-        union = pred_flat.sum() + target_flat.sum()
-        
-        # Handle empty masks
-        if union == 0:
-            return 1.0
-        
-        # Return Dice coefficient
-        return (2. * intersection + smooth) / (union + smooth)
-    else:
-        # For numpy arrays
-        pred = (pred > threshold).astype(np.float32)
-        target = target.astype(np.float32)
-        
-        # Flatten arrays
-        pred_flat = pred.flatten()
-        target_flat = target.flatten()
-        
-        # Calculate intersection and union
-        intersection = (pred_flat * target_flat).sum()
-        union = pred_flat.sum() + target_flat.sum()
-        
-        # Handle empty masks
-        if union == 0:
-            return 1.0
-        
-        # Return Dice coefficient
-        return (2. * intersection + smooth) / (union + smooth)
-
-def dice_loss(pred, target, smooth=1.0):
-    """
-    Calculate Dice loss
-    """
-    dice = dice_coefficient(pred, target, smooth)
-    return 1.0 - dice
+    with torch.no_grad():
+        if isinstance(pred, torch.Tensor):
+            # Apply sigmoid if prediction is logits
+            if pred.max() > 1 or pred.min() < 0:
+                pred = torch.sigmoid(pred)
+            
+            # Apply threshold
+            pred = (pred > threshold).float()
+            target = target.float()
+            
+            # Flatten tensors
+            pred_flat = pred.view(-1)
+            target_flat = target.view(-1)
+            
+            # Calculate intersection and union
+            intersection = (pred_flat * target_flat).sum()
+            union = pred_flat.sum() + target_flat.sum()
+            
+            # Handle empty masks
+            if union == 0:
+                return 1.0
+            
+            # Return Dice coefficient
+            return (2. * intersection + smooth) / (union + smooth)
+        else:
+            # For numpy arrays
+            pred = (pred > threshold).astype(np.float32)
+            target = target.astype(np.float32)
+            
+            # Flatten arrays
+            pred_flat = pred.flatten()
+            target_flat = target.flatten()
+            
+            # Calculate intersection and union
+            intersection = (pred_flat * target_flat).sum()
+            union = pred_flat.sum() + target_flat.sum()
+            
+            # Handle empty masks
+            if union == 0:
+                return 1.0
+            
+            # Return Dice coefficient
+            return (2. * intersection + smooth) / (union + smooth)
 
 def train(model, train_loader, optimizer, device, epoch, num_epochs):
     """
@@ -164,7 +194,6 @@ def train(model, train_loader, optimizer, device, epoch, num_epochs):
     """
     model.train()
     train_loss = 0.0
-    ce_criterion = nn.CrossEntropyLoss()
     
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs} [Train]")
     for images, masks in progress_bar:
@@ -175,14 +204,8 @@ def train(model, train_loader, optimizer, device, epoch, num_epochs):
         
         outputs, _, _, _ = model(images)
         
-        # Cross entropy loss
-        ce_loss = ce_criterion(outputs, masks)
-        
-        # Dice loss
-        dice = dice_loss(outputs[:, 1], masks.float())
-        
-        # Combined loss
-        loss = ce_loss + dice
+        # Use only Dice loss instead of combined loss
+        loss = dice_loss(outputs[:, 1], masks.float())
         
         loss.backward()
         optimizer.step()
@@ -202,7 +225,6 @@ def evaluate(model, val_loader, device, threshold=0.5):
     model.eval()
     val_loss = 0.0
     dice_scores = []
-    ce_criterion = nn.CrossEntropyLoss()
     
     progress_bar = tqdm(val_loader, desc="Evaluating")
     with torch.no_grad():
@@ -212,18 +234,13 @@ def evaluate(model, val_loader, device, threshold=0.5):
             
             outputs, _, _, _ = model(images)
             
-            # Cross entropy loss
-            loss = ce_criterion(outputs, masks)
-
-            # Calculate Dice coefficient    
+            # Use only Dice loss for evaluation as well
             pred = outputs[:, 1]  # Class 1 is "manipulated"
-            dice = dice_coefficient(pred, masks.float(), threshold=threshold)
-
-            dice_loss = dice_loss(outputs[:, 1], masks.float())
-
-            val_loss += loss.item() + dice_loss
+            loss = dice_loss(pred, masks.float())
+            val_loss += loss.item()
             
-
+            # Calculate Dice coefficient
+            dice = dice_coefficient(pred, masks.float(), threshold=threshold)
             
             # Handle both tensor and float returns
             if isinstance(dice, torch.Tensor):
@@ -239,12 +256,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train and Evaluate AI Manipulation Detection')
     parser.add_argument('--data_root', type=str, required=True, 
                       help='Root directory for dataset')
-    parser.add_argument('--batch_size', type=int, default=64, 
+    parser.add_argument('--batch_size', type=int, default=32, 
                       help='Batch size')
     parser.add_argument('--epochs', type=int, default=50, 
                       help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-3, 
+    parser.add_argument('--lr', type=float, default=1e-4, 
                       help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0, 
+                    help='Learning rate')
     parser.add_argument('--gpu', type=int, default=0, 
                       help='GPU ID')
     parser.add_argument('--output_dir', type=str, default='output', 
@@ -261,7 +280,7 @@ def parse_args():
                       default='/root/cv_hack_25/TruFor/TruFor_train_test/pretrained_models/noiseprint++/noiseprint++.th',
                       help='Path to Noiseprint++ weights')
     parser.add_argument('--pretrained', type=str,
-                      default='/root/cv_hack_25/TruFor/TruFor_train_test/pretrained_models/segformers/mit_b2.pth',
+                      default='/root/cv_hack_25/TruFor/TruFor_train_test/pretrained_models/segformers/mit_b5.pth',
                       help='Path to pretrained backbone weights')
     # Add resume training parameter
     parser.add_argument('--resume', type=str, default=None,
@@ -270,7 +289,21 @@ def parse_args():
     return parser.parse_args()
 
 def main():
+
     args = parse_args()
+
+    CONFIG = {
+        "architecture": "TruFor",
+        "encoder": "mit_b5",
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "loss": "DiceLoss",  
+        "optimizer": "Adam",
+        "dataset": "train_1pct"
+    }
+
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -307,10 +340,10 @@ def main():
     
     # Create data loaders
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=32
     )
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4
+        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=32
     )
     
 
@@ -324,7 +357,7 @@ def main():
     config.DATASET.NUM_CLASSES = 2
     
     # Extra settings
-    config.MODEL.EXTRA.BACKBONE = 'mit_b2'
+    config.MODEL.EXTRA.BACKBONE = 'mit_b5'
     config.MODEL.EXTRA.DECODER = 'MLPDecoder'
     config.MODEL.EXTRA.DECODER_EMBED_DIM = 512
     config.MODEL.EXTRA.PREPRC = 'imagenet'
@@ -350,8 +383,7 @@ def main():
         sys.exit(1)
     
     # Create optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     # Initialize variables for training loop
     start_epoch = 1
     best_dice = 0.0
@@ -413,18 +445,8 @@ def main():
         
         return
     
-# Configuration
-    CONFIG = {
-        "architecture": "TruFor",
-        "encoder": "mit_b2",
-        "learning_rate": 1e-3,
-        "weight_decay": 0.0005,
-        "batch_size": args.batch_size,
-        "epochs": args.epochs,
-        "loss": "DiceLoss + CE",
-        "optimizer": "Adam",
-        "dataset": "train_5pct"
-    }
+    # Configuration - Updated to reflect Dice loss only
+
 
     # Initialize WandB
     wandb.init(project="hackathon-truefor", config=CONFIG)
@@ -444,9 +466,7 @@ def main():
             "dice_score": dice_score
         })
 
-        wandb.log({
-        'final_dice': best_dice
-    })
+  
 
         print(f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Dice: {dice_score:.4f}")
         
@@ -487,6 +507,9 @@ def main():
     }, os.path.join(args.output_dir, 'model_final.pth'))
     
     print(f'Training complete! Best Dice: {best_dice:.4f}')
+    wandb.log({
+            'final_dice': best_dice
+    })
     wandb.finish()
 
 if __name__ == '__main__':
