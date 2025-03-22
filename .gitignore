@@ -132,9 +132,13 @@ dmypy.json
 /finetuning/output*
 /finetuning/weights
 /finetuning/submission
-/nohup*
+/finetuning/nohup
 /submission*
 /test_docker/
 /TruFor_train_test/
 /docs/
 /ai_manip_trufor/
+/finetuning/archive/
+/finetuning/nohup_2.out
+/finetuning/nohup_2.out
+/finetuning/wandb/*

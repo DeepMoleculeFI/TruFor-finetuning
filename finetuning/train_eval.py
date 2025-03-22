@@ -15,6 +15,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from tqdm import tqdm
 from PIL import Image
+import wandb
 
 # Add the TruFor path to the system path
 trufor_path = "/root/cv_hack_25/TruFor/TruFor_train_test"
@@ -213,11 +214,16 @@ def evaluate(model, val_loader, device, threshold=0.5):
             
             # Cross entropy loss
             loss = ce_criterion(outputs, masks)
-            val_loss += loss.item()
-            
-            # Calculate Dice coefficient
+
+            # Calculate Dice coefficient    
             pred = outputs[:, 1]  # Class 1 is "manipulated"
             dice = dice_coefficient(pred, masks.float(), threshold=threshold)
+
+            dice_loss = dice_loss(outputs[:, 1], masks.float())
+
+            val_loss += loss.item() + dice_loss
+            
+
             
             # Handle both tensor and float returns
             if isinstance(dice, torch.Tensor):
@@ -233,11 +239,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train and Evaluate AI Manipulation Detection')
     parser.add_argument('--data_root', type=str, required=True, 
                       help='Root directory for dataset')
-    parser.add_argument('--batch_size', type=int, default=32, 
+    parser.add_argument('--batch_size', type=int, default=64, 
                       help='Batch size')
     parser.add_argument('--epochs', type=int, default=50, 
                       help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=0.0001, 
+    parser.add_argument('--lr', type=float, default=1e-3, 
                       help='Learning rate')
     parser.add_argument('--gpu', type=int, default=0, 
                       help='GPU ID')
@@ -257,6 +263,9 @@ def parse_args():
     parser.add_argument('--pretrained', type=str,
                       default='/root/cv_hack_25/TruFor/TruFor_train_test/pretrained_models/segformers/mit_b2.pth',
                       help='Path to pretrained backbone weights')
+    # Add resume training parameter
+    parser.add_argument('--resume', type=str, default=None,
+                      help='Path to checkpoint to resume training from')
     
     return parser.parse_args()
 
@@ -301,9 +310,10 @@ def main():
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4
     )
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=1, shuffle=False, num_workers=4
+        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4
     )
     
+
     # Create model - Use TruFor's config for model creation
     config.defrost()
     
@@ -339,25 +349,63 @@ def main():
         print(f"Error creating model: {e}")
         sys.exit(1)
     
-    # Evaluation only mode
-    if args.eval_only:
-        if args.model_path is None:
-            print("ERROR: --model_path must be specified in evaluation mode")
+    # Create optimizer
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Initialize variables for training loop
+    start_epoch = 1
+    best_dice = 0.0
+    
+    # Check if we need to resume training
+    if args.resume is not None:
+        if not os.path.exists(args.resume):
+            print(f"ERROR: Checkpoint file {args.resume} does not exist")
             sys.exit(1)
         
-        if not os.path.exists(args.model_path):
-            print(f"ERROR: Model file {args.model_path} does not exist")
-            sys.exit(1)
+        print(f"Resuming training from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
         
-        print(f"Loading model from {args.model_path}")
-        checkpoint = torch.load(args.model_path, map_location=device)
-        
+        # Load model state
         if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
             model.load_state_dict(checkpoint['state_dict'])
         else:
             model.load_state_dict(checkpoint)
         
-        print("Model loaded successfully!")
+        # Load optimizer state if available
+        if isinstance(checkpoint, dict) and 'optimizer' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+        
+        # Get starting epoch and best dice score
+        if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1  # Start from the next epoch
+        
+        if isinstance(checkpoint, dict) and 'dice' in checkpoint:
+            best_dice = checkpoint['dice']
+        
+        print(f"Resumed from epoch {start_epoch-1} with best Dice score: {best_dice:.4f}")
+    
+    # Evaluation only mode
+    if args.eval_only:
+        model_path = args.resume if args.resume else args.model_path
+        
+        if model_path is None:
+            print("ERROR: --model_path or --resume must be specified in evaluation mode")
+            sys.exit(1)
+        
+        if not os.path.exists(model_path):
+            print(f"ERROR: Model file {model_path} does not exist")
+            sys.exit(1)
+        
+        if args.resume is None:  # If not already loaded via --resume
+            print(f"Loading model from {model_path}")
+            checkpoint = torch.load(model_path, map_location=device)
+            
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            
+            print("Model loaded successfully!")
         
         # Run evaluation
         val_loss, dice_score = evaluate(model, val_loader, device, args.threshold)
@@ -365,18 +413,41 @@ def main():
         
         return
     
-    # Create optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    
+# Configuration
+    CONFIG = {
+        "architecture": "TruFor",
+        "encoder": "mit_b2",
+        "learning_rate": 1e-3,
+        "weight_decay": 0.0005,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "loss": "DiceLoss + CE",
+        "optimizer": "Adam",
+        "dataset": "train_5pct"
+    }
+
+    # Initialize WandB
+    wandb.init(project="hackathon-truefor", config=CONFIG)
+
     # Training loop
-    best_dice = 0.0
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         # Train for one epoch
         train_loss = train(model, train_loader, optimizer, device, epoch, args.epochs)
         
         # Evaluate
         val_loss, dice_score = evaluate(model, val_loader, device, args.threshold)
         
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "dice_score": dice_score
+        })
+
+        wandb.log({
+        'final_dice': best_dice
+    })
+
         print(f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Dice: {dice_score:.4f}")
         
         # Save best model based on dice coefficient
@@ -398,6 +469,14 @@ def main():
                 'optimizer': optimizer.state_dict(),
                 'dice': dice_score,
             }, os.path.join(args.output_dir, f'checkpoint_epoch{epoch}.pth'))
+        
+        # Always save the latest checkpoint for resuming training
+        torch.save({
+            'epoch': epoch,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'dice': dice_score,
+        }, os.path.join(args.output_dir, 'latest_checkpoint.pth'))
     
     # Save final model
     torch.save({
@@ -408,6 +487,7 @@ def main():
     }, os.path.join(args.output_dir, 'model_final.pth'))
     
     print(f'Training complete! Best Dice: {best_dice:.4f}')
+    wandb.finish()
 
 if __name__ == '__main__':
     main()
