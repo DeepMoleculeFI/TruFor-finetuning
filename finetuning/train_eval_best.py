@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 """
-Combined Training and Evaluation Script for AI Manipulation Detection using TruFor
-Supports training on any dataset size and evaluates using Dice coefficient
-Using Dice Loss only instead of combined loss
+Fine-tuning Script for AI Manipulation Detection using TruFor
+Continues training from a pretrained model checkpoint
 """
 
 import os
@@ -93,44 +92,9 @@ class AIManipDataset(torch.utils.data.Dataset):
         
         return img_tensor, mask_tensor
 
-def dice_loss(pred, target, smooth=1.0):
-    """
-    Calculate Dice loss directly without thresholding for backpropagation
-    
-    Args:
-        pred: Prediction tensor (B, H, W) or (H, W)
-        target: Target tensor (B, H, W) or (H, W)
-        smooth: Smoothing factor
-        
-    Returns:
-        Dice loss (float)
-    """
-    # Apply sigmoid if prediction is logits
-    if pred.max() > 1 or pred.min() < 0:
-        pred = torch.sigmoid(pred)
-    
-    # Convert target to float
-    target = target.float()
-    
-    # Flatten tensors
-    pred_flat = pred.view(-1)
-    target_flat = target.view(-1)
-    
-    # Calculate intersection and union
-    intersection = (pred_flat * target_flat).sum()
-    union = pred_flat.sum() + target_flat.sum()
-    
-    # Handle empty masks
-    if union == 0:
-        return 1.0 - torch.tensor(1.0, device=pred.device, requires_grad=True)
-    
-    # Calculate Dice coefficient and return loss
-    dice = (2. * intersection + smooth) / (union + smooth)
-    return 1.0 - dice
-
 def dice_coefficient(pred, target, smooth=1.0, threshold=0.5):
     """
-    Calculate Dice coefficient for evaluation
+    Calculate Dice coefficient
     
     Args:
         pred: Prediction tensor (B, H, W) or (H, W)
@@ -141,49 +105,55 @@ def dice_coefficient(pred, target, smooth=1.0, threshold=0.5):
     Returns:
         Dice coefficient (float)
     """
-    with torch.no_grad():
-        if isinstance(pred, torch.Tensor):
-            # Apply sigmoid if prediction is logits
-            if pred.max() > 1 or pred.min() < 0:
-                pred = torch.sigmoid(pred)
-            
-            # Apply threshold
-            pred = (pred > threshold).float()
-            target = target.float()
-            
-            # Flatten tensors
-            pred_flat = pred.view(-1)
-            target_flat = target.view(-1)
-            
-            # Calculate intersection and union
-            intersection = (pred_flat * target_flat).sum()
-            union = pred_flat.sum() + target_flat.sum()
-            
-            # Handle empty masks
-            if union == 0:
-                return 1.0
-            
-            # Return Dice coefficient
-            return (2. * intersection + smooth) / (union + smooth)
-        else:
-            # For numpy arrays
-            pred = (pred > threshold).astype(np.float32)
-            target = target.astype(np.float32)
-            
-            # Flatten arrays
-            pred_flat = pred.flatten()
-            target_flat = target.flatten()
-            
-            # Calculate intersection and union
-            intersection = (pred_flat * target_flat).sum()
-            union = pred_flat.sum() + target_flat.sum()
-            
-            # Handle empty masks
-            if union == 0:
-                return 1.0
-            
-            # Return Dice coefficient
-            return (2. * intersection + smooth) / (union + smooth)
+    if isinstance(pred, torch.Tensor):
+        # Apply sigmoid if prediction is logits
+        if pred.max() > 1 or pred.min() < 0:
+            pred = torch.sigmoid(pred)
+        
+        # Apply threshold
+        pred = (pred > threshold).float()
+        target = target.float()
+        
+        # Flatten tensors
+        pred_flat = pred.view(-1)
+        target_flat = target.view(-1)
+        
+        # Calculate intersection and union
+        intersection = (pred_flat * target_flat).sum()
+        union = pred_flat.sum() + target_flat.sum()
+        
+        # Handle empty masks
+        if union == 0:
+            return 1.0
+        
+        # Return Dice coefficient
+        return (2. * intersection + smooth) / (union + smooth)
+    else:
+        # For numpy arrays
+        pred = (pred > threshold).astype(np.float32)
+        target = target.astype(np.float32)
+        
+        # Flatten arrays
+        pred_flat = pred.flatten()
+        target_flat = target.flatten()
+        
+        # Calculate intersection and union
+        intersection = (pred_flat * target_flat).sum()
+        union = pred_flat.sum() + target_flat.sum()
+        
+        # Handle empty masks
+        if union == 0:
+            return 1.0
+        
+        # Return Dice coefficient
+        return (2. * intersection + smooth) / (union + smooth)
+
+def dice_loss(pred, target, smooth=1.0):
+    """
+    Calculate Dice loss
+    """
+    dice = dice_coefficient(pred, target, smooth)
+    return 1.0 - dice
 
 def train(model, train_loader, optimizer, device, epoch, num_epochs):
     """
@@ -194,6 +164,7 @@ def train(model, train_loader, optimizer, device, epoch, num_epochs):
     """
     model.train()
     train_loss = 0.0
+    ce_criterion = nn.CrossEntropyLoss()
     
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs} [Train]")
     for images, masks in progress_bar:
@@ -204,8 +175,14 @@ def train(model, train_loader, optimizer, device, epoch, num_epochs):
         
         outputs, _, _, _ = model(images)
         
-        # Use only Dice loss instead of combined loss
-        loss = dice_loss(outputs[:, 1], masks.float())
+        # Cross entropy loss
+        ce_loss = ce_criterion(outputs, masks)
+        
+        # Dice loss
+        dice = dice_loss(outputs[:, 1], masks.float())
+        
+        # Combined loss
+        loss = ce_loss + dice
         
         loss.backward()
         optimizer.step()
@@ -225,6 +202,7 @@ def evaluate(model, val_loader, device, threshold=0.5):
     model.eval()
     val_loss = 0.0
     dice_scores = []
+    ce_criterion = nn.CrossEntropyLoss()
     
     progress_bar = tqdm(val_loader, desc="Evaluating")
     with torch.no_grad():
@@ -234,12 +212,12 @@ def evaluate(model, val_loader, device, threshold=0.5):
             
             outputs, _, _, _ = model(images)
             
-            # Use only Dice loss for evaluation as well
-            pred = outputs[:, 1]  # Class 1 is "manipulated"
-            loss = dice_loss(pred, masks.float())
+            # Cross entropy loss
+            loss = ce_criterion(outputs, masks)
             val_loss += loss.item()
             
             # Calculate Dice coefficient
+            pred = outputs[:, 1]  # Class 1 is "manipulated"
             dice = dice_coefficient(pred, masks.float(), threshold=threshold)
             
             # Handle both tensor and float returns
@@ -253,102 +231,59 @@ def evaluate(model, val_loader, device, threshold=0.5):
     return val_loss / len(val_loader), np.mean(dice_scores)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train and Evaluate AI Manipulation Detection')
+    parser = argparse.ArgumentParser(description='Fine-tune AI Manipulation Detection model')
     parser.add_argument('--data_root', type=str, required=True, 
                       help='Root directory for dataset')
-    parser.add_argument('--batch_size', type=int, default=16, 
+    parser.add_argument('--batch_size', type=int, default=64, 
                       help='Batch size')
-    parser.add_argument('--epochs', type=int, default=50, 
+    parser.add_argument('--epochs', type=int, default=2, 
                       help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-4, 
+    parser.add_argument('--lr', type=float, default=0.00001, 
                       help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0, 
-                    help='Learning rate')
     parser.add_argument('--gpu', type=int, default=0, 
                       help='GPU ID')
-    parser.add_argument('--output_dir', type=str, default='output', 
+    parser.add_argument('--output_dir', type=str, default='output_finetune', 
                       help='Output directory')
     parser.add_argument('--val_ratio', type=float, default=0.2, 
                       help='Validation set ratio')
-    parser.add_argument('--eval_only', action='store_true',
-                      help='Run evaluation only')
-    parser.add_argument('--model_path', type=str, default=None,
-                      help='Path to trained model for evaluation')
     parser.add_argument('--threshold', type=float, default=0.5,
                       help='Threshold for binary prediction')
     parser.add_argument('--np_weights', type=str, 
                       default='/root/cv_hack_25/TruFor/TruFor_train_test/pretrained_models/noiseprint++/noiseprint++.th',
                       help='Path to Noiseprint++ weights')
     parser.add_argument('--pretrained', type=str,
-                      default='/root/cv_hack_25/TruFor/TruFor_train_test/pretrained_models/segformers/mit_b5.pth',
+                      default='/root/cv_hack_25/TruFor/TruFor_train_test/pretrained_models/segformers/mit_b2.pth',
                       help='Path to pretrained backbone weights')
-    # Add resume training parameter
-    parser.add_argument('--resume', type=str, default=None,
-                      help='Path to checkpoint to resume training from')
-    # Add scheduler parameters
-    parser.add_argument('--scheduler', type=str, default='cosine',
-                      help='Learning rate scheduler: cosine, step, or none')
-    parser.add_argument('--min_lr', type=float, default=1e-6,
-                      help='Minimum learning rate for cosine scheduler')
-    parser.add_argument('--warmup_epochs', type=int, default=5,
-                      help='Number of warmup epochs for learning rate')
+    parser.add_argument('--model_path', type=str, default='/root/cv_hack_25/TruFor/finetuning/archive/output_sub_2/best_dice.pth',
+                      help='Path to previously trained model for fine-tuning')
     
     return parser.parse_args()
 
-def cosine_scheduler(optimizer, epochs, initial_lr, min_lr=1e-6, warmup_epochs=0):
-    """
-    Create a cosine learning rate scheduler with optional warmup.
-    
-    Args:
-        optimizer: PyTorch optimizer
-        epochs: Total number of epochs
-        initial_lr: Initial learning rate
-        min_lr: Minimum learning rate at the end of training
-        warmup_epochs: Number of warmup epochs (linear warmup)
-        
-    Returns:
-        PyTorch learning rate scheduler
-    """
-    from torch.optim.lr_scheduler import LambdaLR
-    import math
-    
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # Linear warmup
-            return epoch / max(1, warmup_epochs)
-        else:
-            # Cosine annealing
-            progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
-            return min_lr / initial_lr + 0.5 * (1 - min_lr / initial_lr) * (1 + math.cos(math.pi * progress))
-    
-    return LambdaLR(optimizer, lr_lambda)
-
 def main():
-
     args = parse_args()
-
-    CONFIG = {
-        "architecture": "TruFor",
-        "encoder": "mit_b5",
-        "learning_rate": args.lr,
-        "weight_decay": args.weight_decay,
-        "batch_size": args.batch_size,
-        "epochs": args.epochs,
-        "loss": "DiceLoss",  
-        "optimizer": "Adam",
-        "dataset": "train_1pct",
-        "scheduler": args.scheduler,
-        "min_lr": args.min_lr,
-        "warmup_epochs": args.warmup_epochs
-    }
-
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+
+    CONFIG = {
+        "architecture": "TruFor",
+        "encoder": "mit_b2",
+        "learning_rate": args.lr,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "loss": "DiceLoss + crossentropyloss",  
+        "optimizer": "Adam",
+        "dataset": "train_full_cobined",
+    }
     
     # Check if data directory exists
     if not os.path.exists(args.data_root):
         print(f"ERROR: Data directory {args.data_root} does not exist")
+        sys.exit(1)
+    
+    # Verify model file exists
+    if not os.path.exists(args.model_path):
+        print(f"ERROR: Model file {args.model_path} does not exist")
         sys.exit(1)
     
     # Verify weight files exist
@@ -361,6 +296,7 @@ def main():
         sys.exit(1)
     
     print(f"Using dataset: {args.data_root}")
+    print(f"Fine-tuning from model: {args.model_path}")
     print(f"Noiseprint++ weights: {args.np_weights}")
     print(f"Pretrained weights: {args.pretrained}")
     
@@ -384,7 +320,6 @@ def main():
         val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4
     )
     
-
     # Create model - Use TruFor's config for model creation
     config.defrost()
     
@@ -395,7 +330,7 @@ def main():
     config.DATASET.NUM_CLASSES = 2
     
     # Extra settings
-    config.MODEL.EXTRA.BACKBONE = 'mit_b5'
+    config.MODEL.EXTRA.BACKBONE = 'mit_b2'
     config.MODEL.EXTRA.DECODER = 'MLPDecoder'
     config.MODEL.EXTRA.DECODER_EMBED_DIM = 512
     config.MODEL.EXTRA.PREPRC = 'imagenet'
@@ -420,119 +355,37 @@ def main():
         print(f"Error creating model: {e}")
         sys.exit(1)
     
-    # Create optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    
-    # Create the learning rate scheduler
-    if args.scheduler.lower() == 'cosine':
-        scheduler = cosine_scheduler(
-            optimizer, 
-            args.epochs, 
-            args.lr, 
-            min_lr=args.min_lr,
-            warmup_epochs=args.warmup_epochs
-        )
-        print(f"Using cosine scheduler with warmup epochs: {args.warmup_epochs}, min_lr: {args.min_lr}")
-    elif args.scheduler.lower() == 'step':
-        from torch.optim.lr_scheduler import StepLR
-        scheduler = StepLR(optimizer, step_size=args.epochs // 3, gamma=0.1)
-        print("Using step scheduler")
-    else:
-        scheduler = None
-        print("No learning rate scheduler used")
-    
-    # Initialize variables for training loop
-    start_epoch = 1
-    best_dice = 0.0
-    
-    # Check if we need to resume training
-    if args.resume is not None:
-        if not os.path.exists(args.resume):
-            print(f"ERROR: Checkpoint file {args.resume} does not exist")
-            sys.exit(1)
+    # Load the pretrained model
+    print(f"Loading pretrained model from {args.model_path}")
+    try:
+        checkpoint = torch.load(args.model_path, map_location=device)
         
-        print(f"Resuming training from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        
-        # Load model state
         if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
             model.load_state_dict(checkpoint['state_dict'])
+            initial_dice = checkpoint.get('dice', 0.0)
+            print(f"Model loaded successfully! Previous best Dice: {initial_dice:.4f}")
         else:
             model.load_state_dict(checkpoint)
-        
-        # Load optimizer state if available
-        if isinstance(checkpoint, dict) and 'optimizer' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-        
-        # Load scheduler state if available
-        if scheduler is not None and isinstance(checkpoint, dict) and 'scheduler' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler'])
-        
-        # Get starting epoch and best dice score
-        if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
-            start_epoch = checkpoint['epoch'] + 1  # Start from the next epoch
-        
-        if isinstance(checkpoint, dict) and 'dice' in checkpoint:
-            best_dice = checkpoint['dice']
-        
-        print(f"Resumed from epoch {start_epoch-1} with best Dice score: {best_dice:.4f}")
-    
-    # Evaluation only mode
-    if args.eval_only:
-        model_path = args.resume if args.resume else args.model_path
-        
-        if model_path is None:
-            print("ERROR: --model_path or --resume must be specified in evaluation mode")
-            sys.exit(1)
-        
-        if not os.path.exists(model_path):
-            print(f"ERROR: Model file {model_path} does not exist")
-            sys.exit(1)
-        
-        if args.resume is None:  # If not already loaded via --resume
-            print(f"Loading model from {model_path}")
-            checkpoint = torch.load(model_path, map_location=device)
-            
-            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['state_dict'])
-            else:
-                model.load_state_dict(checkpoint)
-            
             print("Model loaded successfully!")
-        
-        # Run evaluation
-        val_loss, dice_score = evaluate(model, val_loader, device, args.threshold)
-        print(f"Validation Loss: {val_loss:.4f}, Dice Coefficient: {dice_score:.4f}")
-        
-        return
-        
-    # Initialize WandB
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        sys.exit(1)
+    
+    # Create optimizer
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    
     wandb.init(project="hackathon-truefor", config=CONFIG)
 
-    # Training loop
-    for epoch in range(start_epoch, args.epochs + 1):
+    # Training loop - start from epoch 1 as requested
+    best_dice = 0.0  # Reset best dice for new training
+    for epoch in range(1, args.epochs + 1):
         # Train for one epoch
         train_loss = train(model, train_loader, optimizer, device, epoch, args.epochs)
         
         # Evaluate
         val_loss, dice_score = evaluate(model, val_loader, device, args.threshold)
         
-        # Step the scheduler if it exists
-        if scheduler is not None:
-            scheduler.step()
-            current_lr = scheduler.get_last_lr()[0]
-        else:
-            current_lr = args.lr
-        
-        wandb.log({
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "dice_score": dice_score,
-            "learning_rate": current_lr
-        })
-
-        print(f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Dice: {dice_score:.4f}, LR: {current_lr:.6f}")
+        print(f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Dice: {dice_score:.4f}")
         
         # Save best model based on dice coefficient
         if dice_score > best_dice:
@@ -541,7 +394,6 @@ def main():
                 'epoch': epoch,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict() if scheduler is not None else None,
                 'dice': best_dice,
             }, os.path.join(args.output_dir, 'best_dice.pth'))
             print(f"Saved best model with Dice: {best_dice:.4f}")
@@ -552,29 +404,18 @@ def main():
                 'epoch': epoch,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict() if scheduler is not None else None,
                 'dice': dice_score,
             }, os.path.join(args.output_dir, f'checkpoint_epoch{epoch}.pth'))
-        
-        # Always save the latest checkpoint for resuming training
-        torch.save({
-            'epoch': epoch,
-            'state_dict': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict() if scheduler is not None else None,
-            'dice': dice_score,
-        }, os.path.join(args.output_dir, 'latest_checkpoint.pth'))
     
     # Save final model
     torch.save({
         'epoch': args.epochs,
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
-        'scheduler': scheduler.state_dict() if scheduler is not None else None,
         'dice': dice_score,
     }, os.path.join(args.output_dir, 'model_final.pth'))
     
-    print(f'Training complete! Best Dice: {best_dice:.4f}')
+    print(f'Fine-tuning complete! Best Dice: {best_dice:.4f}')
     wandb.log({
             'final_dice': best_dice
     })
